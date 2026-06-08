@@ -1,0 +1,278 @@
+import json
+import os
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+from dotenv import load_dotenv
+from flask import Flask, jsonify
+from waitress import serve
+
+
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
+
+SUPERVISOR_PORT = int(os.getenv("SUPERVISOR_PORT", "5090"))
+RUNNER_REPOS_BASE = Path(os.getenv("RUNNER_REPOS_BASE", r"C:\repos"))
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def runner_configs() -> list[dict[str, Any]]:
+    return [
+        {
+            "runnerId": "RECEITABX",
+            "displayName": "ReceitaBX",
+            "port": 5050,
+            "baseUrl": os.getenv("RECEITABX_BASE_URL", "http://localhost:5050"),
+            "repoDir": RUNNER_REPOS_BASE / "scriptreceitabx",
+            "startScript": RUNNER_REPOS_BASE / "scriptreceitabx" / "run-receitabx-runner.ps1",
+            "jobsDir": Path(r"C:\RunnerPAD\jobs"),
+            "currentRunFile": Path(r"C:\RunnerPAD\current_run.txt"),
+            "busyFile": Path(r"C:\RunnerPAD\jobs\runner_busy.lock"),
+            "serviceName": "ScriptReceitaBXRunner",
+        },
+        {
+            "runnerId": "ECAC",
+            "displayName": "eCAC",
+            "port": 5060,
+            "baseUrl": os.getenv("ECAC_BASE_URL", "http://localhost:5060"),
+            "repoDir": RUNNER_REPOS_BASE / "scriptecac",
+            "startScript": RUNNER_REPOS_BASE / "scriptecac" / "run-ecac-runner.ps1",
+            "jobsDir": Path(r"C:\RunnerECAC\jobs"),
+            "currentRunFile": Path(r"C:\RunnerECAC\current_run"),
+            "busyFile": Path(r"C:\RunnerECAC\jobs\runner_busy.lock"),
+            "serviceName": "ScriptECACRunner",
+        },
+        {
+            "runnerId": "ESOCIAL",
+            "displayName": "eSocial",
+            "port": 5080,
+            "baseUrl": os.getenv("ESOCIAL_BASE_URL", "http://localhost:5080"),
+            "repoDir": RUNNER_REPOS_BASE / "scriptesocial",
+            "startScript": RUNNER_REPOS_BASE / "scriptesocial" / "run-esocial-runner.ps1",
+            "jobsDir": Path(r"C:\RunnerESocial\jobs"),
+            "currentRunFile": Path(r"C:\RunnerESocial\current_run"),
+            "busyFile": Path(r"C:\RunnerESocial\jobs\runner_busy.lock"),
+            "serviceName": "ScriptESocialRunner",
+        },
+    ]
+
+
+def normalize_runner_id(runner_id: str) -> str:
+    value = (runner_id or "").strip().upper()
+    if value in {"RECEITA", "RECEITA_BX", "M1"}:
+        return "RECEITABX"
+    return value
+
+
+def config_for(runner_id: str) -> dict[str, Any]:
+    normalized = normalize_runner_id(runner_id)
+    for config in runner_configs():
+        if config["runnerId"] == normalized:
+            return config
+    raise ValueError(f"Runner desconhecido: {runner_id}")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def runner_status(config: dict[str, Any]) -> dict[str, Any]:
+    checked_at = now_iso()
+    raw: dict[str, Any] = {}
+    last_error = ""
+    online = False
+
+    try:
+        response = requests.get(f"{config['baseUrl']}/status", timeout=3)
+        response.raise_for_status()
+        raw = response.json()
+        online = True
+    except Exception as exc:
+        last_error = str(exc)
+
+    current = raw.get("currentRun") if isinstance(raw.get("currentRun"), dict) else {}
+    current_run_id = str(current.get("runId") or "").strip()
+    busy = bool(current.get("busy")) or bool(current_run_id)
+    queue_size = int(raw.get("queueSize") or 0) if online else 0
+    state = "OFFLINE" if not online else ("ONLINE_BUSY" if busy else "ONLINE_IDLE")
+
+    return {
+        "runnerId": config["runnerId"],
+        "displayName": config["displayName"],
+        "port": config["port"],
+        "baseUrl": config["baseUrl"],
+        "state": state,
+        "online": online,
+        "busy": busy,
+        "queueSize": queue_size,
+        "currentRunId": current_run_id,
+        "currentRunFile": str(config["currentRunFile"]),
+        "jobsDir": str(config["jobsDir"]),
+        "serviceName": config["serviceName"],
+        "checkedAt": checked_at,
+        "lastError": last_error,
+        "rawStatus": raw,
+    }
+
+
+def run_powershell(script: str) -> None:
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        output = (completed.stdout or "") + (completed.stderr or "")
+        raise RuntimeError(output.strip() or f"PowerShell falhou com codigo {completed.returncode}")
+
+
+def stop_by_port(port: int) -> None:
+    script = (
+        f"$pids = Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue "
+        "| Select-Object -ExpandProperty OwningProcess -Unique; "
+        "foreach ($processId in $pids) { if ($processId) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue } }"
+    )
+    run_powershell(script)
+
+
+def start_runner(config: dict[str, Any]) -> None:
+    start_script = config["startScript"]
+    repo_dir = config["repoDir"]
+    if not start_script.exists():
+        raise FileNotFoundError(f"Script nao encontrado: {start_script}")
+    script = (
+        "Start-Process powershell.exe -WindowStyle Hidden "
+        f"-ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{start_script}\"' "
+        f"-WorkingDirectory '{repo_dir}'"
+    )
+    run_powershell(script)
+
+
+def wait_online(config: dict[str, Any], attempts: int = 15) -> dict[str, Any]:
+    status = runner_status(config)
+    for _ in range(attempts):
+        if status["online"]:
+            return status
+        time.sleep(1)
+        status = runner_status(config)
+    return status
+
+
+def remove_if_exists(path: Path, removed: list[str]) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+            removed.append(str(path))
+    except Exception as exc:
+        raise RuntimeError(f"Falha ao remover {path}: {exc}") from exc
+
+
+def action_response(config: dict[str, Any], action: str, success: bool, message: str) -> dict[str, Any]:
+    return {
+        "runnerId": config["runnerId"],
+        "action": action,
+        "success": success,
+        "message": message,
+        "status": runner_status(config),
+    }
+
+
+app = Flask(__name__)
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "port": SUPERVISOR_PORT, "reposBase": str(RUNNER_REPOS_BASE)})
+
+
+@app.get("/runners/control")
+def status_all():
+    return jsonify([runner_status(config) for config in runner_configs()])
+
+
+@app.get("/runners/control/<runner_id>")
+def status_one(runner_id: str):
+    return jsonify(runner_status(config_for(runner_id)))
+
+
+@app.post("/runners/control/<runner_id>/start")
+def start(runner_id: str):
+    config = config_for(runner_id)
+    status = runner_status(config)
+    if status["online"]:
+        return jsonify(action_response(config, "START", True, "Runner ja esta online."))
+    start_runner(config)
+    final_status = wait_online(config)
+    return jsonify({
+        "runnerId": config["runnerId"],
+        "action": "START",
+        "success": final_status["online"],
+        "message": "Runner iniciado." if final_status["online"] else "Runner iniciado, mas health ainda nao respondeu.",
+        "status": final_status,
+    })
+
+
+@app.post("/runners/control/<runner_id>/restart")
+def restart(runner_id: str):
+    config = config_for(runner_id)
+    stop_by_port(config["port"])
+    time.sleep(2)
+    start_runner(config)
+    final_status = wait_online(config)
+    return jsonify({
+        "runnerId": config["runnerId"],
+        "action": "RESTART",
+        "success": final_status["online"],
+        "message": "Runner reiniciado." if final_status["online"] else "Restart enviado, mas health ainda nao respondeu.",
+        "status": final_status,
+    })
+
+
+@app.post("/runners/control/<runner_id>/unlock")
+def unlock(runner_id: str):
+    config = config_for(runner_id)
+    removed: list[str] = []
+    remove_if_exists(config["currentRunFile"], removed)
+    remove_if_exists(config["busyFile"], removed)
+    remove_if_exists(config["jobsDir"] / "pending_downloads.json", removed)
+    message = "Nenhuma trava local encontrada." if not removed else "Travas removidas: " + ", ".join(removed)
+    return jsonify(action_response(config, "UNLOCK", True, message))
+
+
+@app.post("/runners/control/<runner_id>/restart-and-unlock")
+def restart_and_unlock(runner_id: str):
+    config = config_for(runner_id)
+    stop_by_port(config["port"])
+    time.sleep(2)
+    removed: list[str] = []
+    remove_if_exists(config["currentRunFile"], removed)
+    remove_if_exists(config["busyFile"], removed)
+    remove_if_exists(config["jobsDir"] / "pending_downloads.json", removed)
+    start_runner(config)
+    final_status = wait_online(config)
+    message = "Runner reiniciado."
+    if removed:
+        message += " Travas removidas: " + ", ".join(removed)
+    return jsonify({
+        "runnerId": config["runnerId"],
+        "action": "RESTART_AND_UNLOCK",
+        "success": final_status["online"],
+        "message": message,
+        "status": final_status,
+    })
+
+
+if __name__ == "__main__":
+    serve(app, host="0.0.0.0", port=SUPERVISOR_PORT, threads=8)
