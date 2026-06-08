@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -94,7 +95,7 @@ def runner_status(config: dict[str, Any]) -> dict[str, Any]:
     online = False
 
     try:
-        response = requests.get(f"{config['baseUrl']}/status", timeout=3)
+        response = requests.get(f"{config['baseUrl']}/status", timeout=(0.8, 1.5))
         response.raise_for_status()
         raw = response.json()
         online = True
@@ -123,6 +124,34 @@ def runner_status(config: dict[str, Any]) -> dict[str, Any]:
         "checkedAt": checked_at,
         "lastError": last_error,
         "rawStatus": raw,
+    }
+
+
+def safe_runner_status(config: dict[str, Any]) -> dict[str, Any]:
+    future = status_executor.submit(runner_status, config)
+    try:
+        return future.result(timeout=2.5)
+    except TimeoutError:
+        return offline_status(config, "Timeout ao consultar runner")
+
+
+def offline_status(config: dict[str, Any], error: str) -> dict[str, Any]:
+    return {
+        "runnerId": config["runnerId"],
+        "displayName": config["displayName"],
+        "port": config["port"],
+        "baseUrl": config["baseUrl"],
+        "state": "OFFLINE",
+        "online": False,
+        "busy": False,
+        "queueSize": 0,
+        "currentRunId": "",
+        "currentRunFile": str(config["currentRunFile"]),
+        "jobsDir": str(config["jobsDir"]),
+        "serviceName": config["serviceName"],
+        "checkedAt": now_iso(),
+        "lastError": error,
+        "rawStatus": {},
     }
 
 
@@ -190,6 +219,7 @@ def action_response(config: dict[str, Any], action: str, success: bool, message:
 
 
 app = Flask(__name__)
+status_executor = ThreadPoolExecutor(max_workers=6)
 
 
 @app.get("/health")
@@ -199,12 +229,12 @@ def health():
 
 @app.get("/runners/control")
 def status_all():
-    return jsonify([runner_status(config) for config in runner_configs()])
+    return jsonify([safe_runner_status(config) for config in runner_configs()])
 
 
 @app.get("/runners/control/<runner_id>")
 def status_one(runner_id: str):
-    return jsonify(runner_status(config_for(runner_id)))
+    return jsonify(safe_runner_status(config_for(runner_id)))
 
 
 @app.post("/runners/control/<runner_id>/start")
