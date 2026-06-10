@@ -168,11 +168,25 @@ def run_powershell(script: str) -> None:
 
 
 def stop_by_port(port: int) -> None:
-    script = (
-        f"$pids = Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue "
-        "| Select-Object -ExpandProperty OwningProcess -Unique; "
-        "foreach ($processId in $pids) { if ($processId) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue } }"
-    )
+    script = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$pids = @()
+try {{
+    $pids = @(Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique)
+}} catch {{
+    $pids = @()
+}}
+
+foreach ($processId in $pids) {{
+    if ($processId) {{
+        try {{
+            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        }} catch {{}}
+    }}
+}}
+exit 0
+"""
     run_powershell(script)
 
 
