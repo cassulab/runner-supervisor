@@ -222,6 +222,22 @@ def remove_if_exists(path: Path, removed: list[str]) -> None:
         raise RuntimeError(f"Falha ao remover {path}: {exc}") from exc
 
 
+def clear_runner_queue(config: dict[str, Any]) -> tuple[int, str, bool]:
+    try:
+        response = requests.post(f"{config['baseUrl']}/clear-queue", timeout=(1.5, 5))
+        response.raise_for_status()
+        data = response.json() if response.content else {}
+        removed = int(data.get("removed") or 0)
+        message = str(data.get("message") or "Fila limpa.")
+        return removed, message, True
+    except Exception as exc:
+        removed_files: list[str] = []
+        remove_if_exists(config["jobsDir"] / "pending_downloads.json", removed_files)
+        if removed_files:
+            return len(removed_files), "Runner offline; arquivos de fila removidos: " + ", ".join(removed_files), True
+        return 0, f"Nao foi possivel limpar a fila em memoria do runner: {exc}", False
+
+
 def action_response(config: dict[str, Any], action: str, success: bool, message: str) -> dict[str, Any]:
     return {
         "runnerId": config["runnerId"],
@@ -293,6 +309,13 @@ def unlock(runner_id: str):
     remove_if_exists(config["jobsDir"] / "pending_downloads.json", removed)
     message = "Nenhuma trava local encontrada." if not removed else "Travas removidas: " + ", ".join(removed)
     return jsonify(action_response(config, "UNLOCK", True, message))
+
+
+@app.post("/runners/control/<runner_id>/clear-queue")
+def clear_queue(runner_id: str):
+    config = config_for(runner_id)
+    removed, message, success = clear_runner_queue(config)
+    return jsonify(action_response(config, "CLEAR_QUEUE", success, f"{message} Itens removidos: {removed}."))
 
 
 @app.post("/runners/control/<runner_id>/restart-and-unlock")
