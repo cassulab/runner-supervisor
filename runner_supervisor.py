@@ -190,6 +190,54 @@ exit 0
     run_powershell(script)
 
 
+def stop_runner(config: dict[str, Any]) -> None:
+    repo_dir = str(config["repoDir"]).replace("'", "''")
+    start_script = str(config["startScript"]).replace("'", "''")
+    port = int(config["port"])
+    script = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$targets = New-Object System.Collections.Generic.HashSet[int]
+
+try {{
+    Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique |
+        ForEach-Object {{ if ($_ -and $_ -gt 0) {{ [void]$targets.Add([int]$_) }} }}
+}} catch {{}}
+
+$repoNeedle = '{repo_dir}'
+$scriptNeedle = '{start_script}'
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {{
+        $_.CommandLine -and (
+            $_.CommandLine -like "*$repoNeedle*" -or
+            $_.CommandLine -like "*$scriptNeedle*"
+        )
+    }} |
+    ForEach-Object {{ [void]$targets.Add([int]$_.ProcessId) }}
+
+$all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+function Add-Children([int]$parentId) {{
+    foreach ($child in $all | Where-Object {{ $_.ParentProcessId -eq $parentId }}) {{
+        if ($child.ProcessId -and $targets.Add([int]$child.ProcessId)) {{
+            Add-Children -parentId ([int]$child.ProcessId)
+        }}
+    }}
+}}
+
+foreach ($targetId in @($targets)) {{
+    Add-Children -parentId ([int]$targetId)
+}}
+
+foreach ($processId in (@($targets) | Sort-Object -Descending)) {{
+    try {{
+        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    }} catch {{}}
+}}
+exit 0
+"""
+    run_powershell(script)
+
+
 def start_runner(config: dict[str, Any]) -> None:
     start_script = config["startScript"]
     repo_dir = config["repoDir"]
@@ -319,7 +367,7 @@ def start(runner_id: str):
 @app.post("/runners/control/<runner_id>/restart")
 def restart(runner_id: str):
     config = config_for(runner_id)
-    stop_by_port(config["port"])
+    stop_runner(config)
     time.sleep(2)
     start_runner(config)
     final_status = wait_online(config)
@@ -351,7 +399,7 @@ def clear_queue(runner_id: str):
 @app.post("/runners/control/<runner_id>/restart-and-unlock")
 def restart_and_unlock(runner_id: str):
     config = config_for(runner_id)
-    stop_by_port(config["port"])
+    stop_runner(config)
     time.sleep(2)
     removed: list[str] = []
     clear_local_state(config, removed, include_queue=False)
@@ -372,7 +420,7 @@ def restart_and_unlock(runner_id: str):
 @app.post("/runners/control/<runner_id>/reset-total")
 def reset_total(runner_id: str):
     config = config_for(runner_id)
-    stop_by_port(config["port"])
+    stop_runner(config)
     time.sleep(2)
     removed: list[str] = []
     clear_local_state(config, removed, include_queue=True)
