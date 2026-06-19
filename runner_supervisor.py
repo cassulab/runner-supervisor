@@ -222,17 +222,49 @@ def remove_if_exists(path: Path, removed: list[str]) -> None:
         raise RuntimeError(f"Falha ao remover {path}: {exc}") from exc
 
 
+def remove_queue_files(config: dict[str, Any], removed: list[str], include_locks: bool = False) -> None:
+    jobs_dir = config["jobsDir"]
+    if not jobs_dir.exists():
+        return
+
+    protected = set()
+    if not include_locks:
+        protected.add(config["busyFile"].resolve())
+
+    for item in jobs_dir.iterdir():
+        if not item.is_file():
+            continue
+        try:
+            resolved = item.resolve()
+        except Exception:
+            resolved = item
+        if resolved in protected:
+            continue
+        remove_if_exists(item, removed)
+
+
+def clear_local_state(config: dict[str, Any], removed: list[str], include_queue: bool = False) -> None:
+    remove_if_exists(config["currentRunFile"], removed)
+    remove_if_exists(config["busyFile"], removed)
+    remove_if_exists(config["jobsDir"] / "pending_downloads.json", removed)
+    if include_queue:
+        remove_queue_files(config, removed, include_locks=True)
+
+
 def clear_runner_queue(config: dict[str, Any]) -> tuple[int, str, bool]:
+    removed_files: list[str] = []
     try:
         response = requests.post(f"{config['baseUrl']}/clear-queue", timeout=(1.5, 5))
         response.raise_for_status()
         data = response.json() if response.content else {}
         removed = int(data.get("removed") or 0)
         message = str(data.get("message") or "Fila limpa.")
-        return removed, message, True
+        remove_queue_files(config, removed_files)
+        if removed_files:
+            message += " Arquivos locais removidos: " + ", ".join(removed_files)
+        return removed + len(removed_files), message, True
     except Exception as exc:
-        removed_files: list[str] = []
-        remove_if_exists(config["jobsDir"] / "pending_downloads.json", removed_files)
+        remove_queue_files(config, removed_files)
         if removed_files:
             return len(removed_files), "Runner offline; arquivos de fila removidos: " + ", ".join(removed_files), True
         return 0, f"Nao foi possivel limpar a fila em memoria do runner: {exc}", False
@@ -304,9 +336,7 @@ def restart(runner_id: str):
 def unlock(runner_id: str):
     config = config_for(runner_id)
     removed: list[str] = []
-    remove_if_exists(config["currentRunFile"], removed)
-    remove_if_exists(config["busyFile"], removed)
-    remove_if_exists(config["jobsDir"] / "pending_downloads.json", removed)
+    clear_local_state(config, removed, include_queue=False)
     message = "Nenhuma trava local encontrada." if not removed else "Travas removidas: " + ", ".join(removed)
     return jsonify(action_response(config, "UNLOCK", True, message))
 
@@ -324,9 +354,7 @@ def restart_and_unlock(runner_id: str):
     stop_by_port(config["port"])
     time.sleep(2)
     removed: list[str] = []
-    remove_if_exists(config["currentRunFile"], removed)
-    remove_if_exists(config["busyFile"], removed)
-    remove_if_exists(config["jobsDir"] / "pending_downloads.json", removed)
+    clear_local_state(config, removed, include_queue=False)
     start_runner(config)
     final_status = wait_online(config)
     message = "Runner reiniciado."
@@ -336,6 +364,28 @@ def restart_and_unlock(runner_id: str):
         "runnerId": config["runnerId"],
         "action": "RESTART_AND_UNLOCK",
         "success": final_status["online"],
+        "message": message,
+        "status": final_status,
+    })
+
+
+@app.post("/runners/control/<runner_id>/reset-total")
+def reset_total(runner_id: str):
+    config = config_for(runner_id)
+    stop_by_port(config["port"])
+    time.sleep(2)
+    removed: list[str] = []
+    clear_local_state(config, removed, include_queue=True)
+    start_runner(config)
+    final_status = wait_online(config)
+    success = final_status["online"] and not final_status["busy"] and final_status["queueSize"] == 0
+    message = "Reset total concluido." if success else "Reset total executado, mas o runner ainda reportou ocupado ou com fila."
+    if removed:
+        message += " Arquivos removidos: " + ", ".join(removed)
+    return jsonify({
+        "runnerId": config["runnerId"],
+        "action": "RESET_TOTAL",
+        "success": success,
         "message": message,
         "status": final_status,
     })
