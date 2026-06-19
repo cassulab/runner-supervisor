@@ -315,6 +315,26 @@ def clear_runner_queue(config: dict[str, Any]) -> tuple[int, str, bool]:
         remove_queue_files(config, removed_files)
         if removed_files:
             return len(removed_files), "Runner offline; arquivos de fila removidos: " + ", ".join(removed_files), True
+
+        status = runner_status(config)
+        if status["online"] and status["queueSize"] > 0:
+            stop_runner(config)
+            time.sleep(2)
+            remove_queue_files(config, removed_files)
+            start_runner(config)
+            final_status = wait_online(config)
+            if final_status["online"]:
+                return (
+                    len(removed_files),
+                    "Runner nao possui rota de limpar fila; processo reiniciado para limpar fila em memoria.",
+                    True,
+                )
+            return (
+                len(removed_files),
+                "Runner nao possui rota de limpar fila; processo foi reiniciado, mas ainda nao respondeu online.",
+                False,
+            )
+
         return 0, f"Nao foi possivel limpar a fila em memoria do runner: {exc}", False
 
 
