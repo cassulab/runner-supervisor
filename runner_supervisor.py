@@ -436,6 +436,21 @@ def restart(runner_id: str):
     })
 
 
+@app.post("/runners/control/<runner_id>/stop")
+def stop(runner_id: str):
+    config = config_for(runner_id)
+    stop_runner(config)
+    time.sleep(1)
+    final_status = safe_runner_status(config)
+    return jsonify({
+        "runnerId": config["runnerId"],
+        "action": "STOP",
+        "success": not final_status["online"],
+        "message": "Runner desligado." if not final_status["online"] else "Comando de desligar enviado, mas o runner ainda respondeu online.",
+        "status": final_status,
+    })
+
+
 @app.post("/runners/control/<runner_id>/unlock")
 def unlock(runner_id: str):
     config = config_for(runner_id)
