@@ -242,12 +242,29 @@ def start_runner(config: dict[str, Any]) -> None:
     repo_dir = config["repoDir"]
     if not start_script.exists():
         raise FileNotFoundError(f"Script nao encontrado: {start_script}")
-    script = (
-        "Start-Process powershell.exe -WindowStyle Hidden "
-        f"-ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{start_script}\"' "
-        f"-WorkingDirectory '{repo_dir}'"
+    creationflags = 0
+    startupinfo = None
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NO_WINDOW
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+    subprocess.Popen(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(start_script),
+        ],
+        cwd=str(repo_dir),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        startupinfo=startupinfo,
     )
-    run_powershell(script)
 
 
 def wait_online(config: dict[str, Any], attempts: int = 15) -> dict[str, Any]:
