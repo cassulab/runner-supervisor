@@ -329,10 +329,12 @@ def clear_runner_queue(config: dict[str, Any]) -> tuple[int, str, bool]:
         return removed + len(removed_files), message, True
     except Exception as exc:
         route_error = str(exc)
+        stopped = False
         try:
             stop_runner(config)
+            stopped = True
             time.sleep(2)
-            remove_queue_files(config, removed_files)
+            clear_local_state(config, removed_files, include_queue=True)
             start_runner(config)
             final_status = wait_online(config)
             success = final_status["online"] and final_status["queueSize"] == 0 and not final_status["busy"]
@@ -349,9 +351,16 @@ def clear_runner_queue(config: dict[str, Any]) -> tuple[int, str, bool]:
             )
         except Exception as control_exc:
             try:
-                remove_queue_files(config, removed_files)
+                clear_local_state(config, removed_files, include_queue=True)
             except Exception as remove_exc:
                 return 0, f"Falha ao limpar fila. Rota: {route_error}. Controle: {control_exc}. Remocao: {remove_exc}", False
+            if stopped and removed_files:
+                return (
+                    len(removed_files),
+                    "Fila e travas locais removidas. Nao consegui reiniciar o runner automaticamente; inicie pelo botao Iniciar. "
+                    f"Rota: {route_error}. Controle: {control_exc}",
+                    True,
+                )
             return (
                 len(removed_files),
                 "Arquivos de fila removidos, mas nao foi possivel reiniciar o runner. "
