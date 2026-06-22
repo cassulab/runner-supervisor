@@ -196,12 +196,12 @@ def stop_runner(config: dict[str, Any]) -> None:
     port = int(config["port"])
     script = f"""
 $ErrorActionPreference = 'SilentlyContinue'
-$targets = New-Object System.Collections.Generic.HashSet[int]
+$targets = @()
 
 try {{
     Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty OwningProcess -Unique |
-        ForEach-Object {{ if ($_ -and $_ -gt 0) {{ [void]$targets.Add([int]$_) }} }}
+        ForEach-Object {{ if ($_ -and $_ -gt 0) {{ $targets += [int]$_ }} }}
 }} catch {{}}
 
 $repoNeedle = '{repo_dir}'
@@ -213,22 +213,21 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
             $_.CommandLine -like "*$scriptNeedle*"
         )
     }} |
-    ForEach-Object {{ [void]$targets.Add([int]$_.ProcessId) }}
+    ForEach-Object {{ $targets += [int]$_.ProcessId }}
 
-$all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
-function Add-Children([int]$parentId) {{
-    foreach ($child in $all | Where-Object {{ $_.ParentProcessId -eq $parentId }}) {{
-        if ($child.ProcessId -and $targets.Add([int]$child.ProcessId)) {{
-            Add-Children -parentId ([int]$child.ProcessId)
+$all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+$changed = $true
+while ($changed) {{
+    $changed = $false
+    foreach ($process in $all) {{
+        if ($process.ParentProcessId -in $targets -and $process.ProcessId -notin $targets) {{
+            $targets += [int]$process.ProcessId
+            $changed = $true
         }}
     }}
 }}
 
-foreach ($targetId in @($targets)) {{
-    Add-Children -parentId ([int]$targetId)
-}}
-
-foreach ($processId in (@($targets) | Sort-Object -Descending)) {{
+foreach ($processId in ($targets | Select-Object -Unique | Sort-Object -Descending)) {{
     try {{
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }} catch {{}}
@@ -312,12 +311,8 @@ def clear_runner_queue(config: dict[str, Any]) -> tuple[int, str, bool]:
             message += " Arquivos locais removidos: " + ", ".join(removed_files)
         return removed + len(removed_files), message, True
     except Exception as exc:
-        remove_queue_files(config, removed_files)
-        if removed_files:
-            return len(removed_files), "Runner offline; arquivos de fila removidos: " + ", ".join(removed_files), True
-
-        status = runner_status(config)
-        if status["online"]:
+        route_error = str(exc)
+        try:
             stop_runner(config)
             time.sleep(2)
             remove_queue_files(config, removed_files)
@@ -332,11 +327,20 @@ def clear_runner_queue(config: dict[str, Any]) -> tuple[int, str, bool]:
                 )
             return (
                 len(removed_files),
-                "Runner nao possui rota de limpar fila; processo reiniciado, mas ainda reportou ocupado ou com fila.",
+                "Runner reiniciado para limpar fila, mas ainda reportou ocupado ou com fila. Erro original: " + route_error,
                 False,
             )
-
-        return 0, f"Nao foi possivel limpar a fila em memoria do runner: {exc}", False
+        except Exception as control_exc:
+            try:
+                remove_queue_files(config, removed_files)
+            except Exception as remove_exc:
+                return 0, f"Falha ao limpar fila. Rota: {route_error}. Controle: {control_exc}. Remocao: {remove_exc}", False
+            return (
+                len(removed_files),
+                "Arquivos de fila removidos, mas nao foi possivel reiniciar o runner. "
+                f"Rota: {route_error}. Controle: {control_exc}",
+                bool(removed_files),
+            )
 
 
 def action_response(config: dict[str, Any], action: str, success: bool, message: str) -> dict[str, Any]:
@@ -351,6 +355,11 @@ def action_response(config: dict[str, Any], action: str, success: bool, message:
 
 app = Flask(__name__)
 status_executor = ThreadPoolExecutor(max_workers=6)
+
+
+@app.errorhandler(Exception)
+def handle_error(exc: Exception):
+    return jsonify({"success": False, "message": str(exc), "error": type(exc).__name__}), 500
 
 
 @app.get("/health")
@@ -441,14 +450,29 @@ def restart_and_unlock(runner_id: str):
 @app.post("/runners/control/<runner_id>/reset-total")
 def reset_total(runner_id: str):
     config = config_for(runner_id)
-    stop_runner(config)
-    time.sleep(2)
     removed: list[str] = []
-    clear_local_state(config, removed, include_queue=True)
-    start_runner(config)
+    errors: list[str] = []
+    try:
+        stop_runner(config)
+        time.sleep(2)
+    except Exception as exc:
+        errors.append(f"falha ao parar runner: {exc}")
+    try:
+        clear_local_state(config, removed, include_queue=True)
+    except Exception as exc:
+        errors.append(f"falha ao limpar arquivos: {exc}")
+    try:
+        start_runner(config)
+    except Exception as exc:
+        errors.append(f"falha ao iniciar runner: {exc}")
     final_status = wait_online(config)
-    success = final_status["online"] and not final_status["busy"] and final_status["queueSize"] == 0
-    message = "Reset total concluido." if success else "Reset total executado, mas o runner ainda reportou ocupado ou com fila."
+    success = not errors and final_status["online"] and not final_status["busy"] and final_status["queueSize"] == 0
+    if success:
+        message = "Reset total concluido."
+    else:
+        message = "Reset total executado, mas ainda ha pendencia."
+        if errors:
+            message += " " + " | ".join(errors)
     if removed:
         message += " Arquivos removidos: " + ", ".join(removed)
     return jsonify({
