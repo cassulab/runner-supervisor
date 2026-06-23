@@ -197,11 +197,12 @@ def stop_runner(config: dict[str, Any]) -> None:
     script = f"""
 $ErrorActionPreference = 'SilentlyContinue'
 $targets = @()
+$selfPid = $PID
 
 try {{
     Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty OwningProcess -Unique |
-        ForEach-Object {{ if ($_ -and $_ -gt 0) {{ $targets += [int]$_ }} }}
+        ForEach-Object {{ if ($_ -and $_ -gt 0 -and [int]$_ -ne $selfPid) {{ $targets += [int]$_ }} }}
 }} catch {{}}
 
 $repoNeedle = '{repo_dir}'
@@ -211,7 +212,7 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         $_.CommandLine -and (
             $_.CommandLine -like "*$repoNeedle*" -or
             $_.CommandLine -like "*$scriptNeedle*"
-        )
+        ) -and $_.ProcessId -ne $selfPid
     }} |
     ForEach-Object {{ $targets += [int]$_.ProcessId }}
 
@@ -220,7 +221,7 @@ $changed = $true
 while ($changed) {{
     $changed = $false
     foreach ($process in $all) {{
-        if ($process.ParentProcessId -in $targets -and $process.ProcessId -notin $targets) {{
+        if ($process.ParentProcessId -in $targets -and $process.ProcessId -ne $selfPid -and $process.ProcessId -notin $targets) {{
             $targets += [int]$process.ProcessId
             $changed = $true
         }}
@@ -229,7 +230,9 @@ while ($changed) {{
 
 foreach ($processId in ($targets | Select-Object -Unique | Sort-Object -Descending)) {{
     try {{
-        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        if ($processId -and [int]$processId -ne $selfPid) {{
+            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        }}
     }} catch {{}}
 }}
 exit 0
