@@ -206,45 +206,87 @@ def stop_runner(config: dict[str, Any]) -> None:
     port = int(config["port"])
     script = f"""
 $ErrorActionPreference = 'SilentlyContinue'
-$targets = @()
 $selfPid = $PID
+$targets = New-Object System.Collections.Generic.List[int]
 
-try {{
-    Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty OwningProcess -Unique |
-        ForEach-Object {{ if ($_ -and $_ -gt 0 -and [int]$_ -ne $selfPid) {{ $targets += [int]$_ }} }}
-}} catch {{}}
-
-$repoNeedle = '{repo_dir}'
-$scriptNeedle = '{start_script}'
-Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object {{
-        $_.CommandLine -and (
-            $_.CommandLine -like "*$repoNeedle*" -or
-            $_.CommandLine -like "*$scriptNeedle*"
-        ) -and $_.ProcessId -ne $selfPid
-    }} |
-    ForEach-Object {{ $targets += [int]$_.ProcessId }}
-
-$all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
-$changed = $true
-while ($changed) {{
-    $changed = $false
-    foreach ($process in $all) {{
-        if ($process.ParentProcessId -in $targets -and $process.ProcessId -ne $selfPid -and $process.ProcessId -notin $targets) {{
-            $targets += [int]$process.ProcessId
-            $changed = $true
-        }}
+function Add-Target([int]$processId) {{
+    if ($processId -and $processId -gt 0 -and $processId -ne $selfPid -and -not $targets.Contains($processId)) {{
+        [void]$targets.Add($processId)
     }}
 }}
 
-foreach ($processId in ($targets | Select-Object -Unique | Sort-Object -Descending)) {{
+$repoNeedle = '{repo_dir}'
+$scriptNeedle = '{start_script}'
+
+for ($attempt = 0; $attempt -lt 5; $attempt++) {{
     try {{
-        if ($processId -and [int]$processId -ne $selfPid) {{
-            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
-        }}
+        Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            ForEach-Object {{ Add-Target ([int]$_) }}
     }} catch {{}}
+
+    try {{
+        netstat -ano -p tcp |
+            Select-String ":{port}\\s+.*LISTENING\\s+(\\d+)" |
+            ForEach-Object {{
+                $match = [regex]::Match($_.Line, "LISTENING\\s+(\\d+)")
+                if ($match.Success) {{ Add-Target ([int]$match.Groups[1].Value) }}
+            }}
+    }} catch {{}}
+
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {{
+            $_.CommandLine -and (
+                $_.CommandLine -like "*$repoNeedle*" -or
+                $_.CommandLine -like "*$scriptNeedle*"
+            ) -and $_.ProcessId -ne $selfPid
+        }} |
+        ForEach-Object {{ Add-Target ([int]$_.ProcessId) }}
+
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $changed = $true
+    while ($changed) {{
+        $changed = $false
+        foreach ($process in $all) {{
+            if ($targets.Contains([int]$process.ParentProcessId)) {{
+                $before = $targets.Count
+                Add-Target ([int]$process.ProcessId)
+                if ($targets.Count -gt $before) {{ $changed = $true }}
+            }}
+        }}
+    }}
+
+    foreach ($processId in ($targets.ToArray() | Sort-Object -Descending -Unique)) {{
+        try {{
+            taskkill.exe /PID $processId /T /F | Out-Null
+        }} catch {{}}
+        try {{
+            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        }} catch {{}}
+    }}
+
+    Start-Sleep -Milliseconds 500
+    $stillListening = $false
+    try {{
+        $stillListening = [bool](Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue)
+    }} catch {{
+        $stillListening = $false
+    }}
+    if (-not $stillListening) {{
+        break
+    }}
 }}
+
+try {{
+    netstat -ano -p tcp |
+        Select-String ":{port}\\s+.*LISTENING\\s+(\\d+)" |
+        ForEach-Object {{
+            $match = [regex]::Match($_.Line, "LISTENING\\s+(\\d+)")
+            if ($match.Success) {{
+                taskkill.exe /PID ([int]$match.Groups[1].Value) /T /F | Out-Null
+            }}
+        }}
+}} catch {{}}
 exit 0
 """
     run_powershell(script, strict=False)
@@ -287,6 +329,17 @@ def wait_online(config: dict[str, Any], attempts: int = 15) -> dict[str, Any]:
             return status
         time.sleep(1)
         status = runner_status(config)
+    return status
+
+
+def wait_offline(config: dict[str, Any], attempts: int = 10) -> dict[str, Any]:
+    status = safe_runner_status(config)
+    for _ in range(attempts):
+        if not status["online"]:
+            return status
+        stop_runner(config)
+        time.sleep(1)
+        status = safe_runner_status(config)
     return status
 
 
@@ -453,8 +506,7 @@ def restart(runner_id: str):
 def stop(runner_id: str):
     config = config_for(runner_id)
     stop_runner(config)
-    time.sleep(1)
-    final_status = safe_runner_status(config)
+    final_status = wait_offline(config)
     return jsonify({
         "runnerId": config["runnerId"],
         "action": "STOP",
