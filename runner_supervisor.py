@@ -155,16 +155,26 @@ def offline_status(config: dict[str, Any], error: str) -> dict[str, Any]:
     }
 
 
-def run_powershell(script: str) -> None:
-    completed = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+def run_powershell(script: str, strict: bool = True) -> tuple[int, str]:
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        if strict:
+            raise RuntimeError("PowerShell excedeu o tempo limite")
+        return -1, "PowerShell excedeu o tempo limite"
+
+    output = ((completed.stdout or "") + (completed.stderr or "")).strip()
     if completed.returncode != 0:
-        output = (completed.stdout or "") + (completed.stderr or "")
-        raise RuntimeError(output.strip() or f"PowerShell falhou com codigo {completed.returncode}")
+        message = output or f"PowerShell falhou com codigo {completed.returncode}"
+        if strict:
+            raise RuntimeError(message)
+        return completed.returncode, message
+    return completed.returncode, output
 
 
 def stop_by_port(port: int) -> None:
@@ -187,7 +197,7 @@ foreach ($processId in $pids) {{
 }}
 exit 0
 """
-    run_powershell(script)
+    run_powershell(script, strict=False)
 
 
 def stop_runner(config: dict[str, Any]) -> None:
@@ -237,7 +247,7 @@ foreach ($processId in ($targets | Select-Object -Unique | Sort-Object -Descendi
 }}
 exit 0
 """
-    run_powershell(script)
+    run_powershell(script, strict=False)
 
 
 def start_runner(config: dict[str, Any]) -> None:
